@@ -1,0 +1,18 @@
+[package]
+name = "fvault"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+async-compression = { version = "0.4", features = ["tokio", "brotli"] }
+bincode = "2"
+blake3 = "1"
+clap = { version = "4", features = ["derive"] }
+elliptic-curve = "0.13"
+rand = "0.9"
+redb = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio_chacha20 = { git = "https://github.com/Banyc/tokio_chacha20.git", tag = "v0.0.7" }
