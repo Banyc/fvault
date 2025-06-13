@@ -1,7 +1,7 @@
 pub mod cli;
 pub mod copy;
 pub mod cx;
-pub mod db_val;
+pub mod db;
 pub mod hash;
 pub mod index;
 pub mod limit_read;

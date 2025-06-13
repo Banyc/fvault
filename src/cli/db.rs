@@ -6,6 +6,7 @@ use std::{
 use anyhow::Context;
 use async_compression::tokio::{bufread::BrotliDecoder, write::BrotliEncoder};
 use clap::Args;
+use redb::TableDefinition;
 use tokio::{
     fs::{File, try_exists},
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
@@ -24,23 +25,23 @@ use crate::{
     cli::path::REPO_DIR_NAME,
     copy::{CopyConfig, copy_2},
     cx::INDEX_DB_NAME,
+    db::{CloseWrite, Db, read_table_result, val::Bincode, write_table_result},
     limit_read::LimitReader,
 };
 
 pub const ENCRYPTED_DB_NAME: &str = "index.nah";
 pub const DECRYPTING_DB_NAME: &str = "index.tmp";
 
+const EN_KEY_TABLE: TableDefinition<Bincode<()>, Bincode<Vec<u8>>> = TableDefinition::new("en_key");
+
 #[derive(Debug, Clone, Args)]
-pub struct EncryptArgs {}
-pub async fn exec_encrypt(_args: EncryptArgs, repo_base: impl AsRef<Path>) -> anyhow::Result<()> {
+pub struct EncryptArgs {
+    pub reset: bool,
+}
+pub async fn exec_encrypt(args: EncryptArgs, repo_base: impl AsRef<Path>) -> anyhow::Result<()> {
     let repo_path = repo_base.as_ref().join(REPO_DIR_NAME);
     let db_src_path = repo_path.join(INDEX_DB_NAME);
     let db_dst_path = repo_path.join(ENCRYPTED_DB_NAME);
-    let mut db_src = File::options()
-        .read(true)
-        .open(&db_src_path)
-        .await
-        .with_context(|| anyhow::anyhow!("{db_src_path:?}"))?;
     let mut db_dst = File::options()
         .create(true)
         .truncate(true)
@@ -48,8 +49,42 @@ pub async fn exec_encrypt(_args: EncryptArgs, repo_base: impl AsRef<Path>) -> an
         .open(&db_dst_path)
         .await
         .with_context(|| anyhow::anyhow!("{db_dst_path:?}"))?;
-    let key = read_key_from_stdin().await?;
+    let key: Option<[u8; KEY_BYTES]> = if !args.reset {
+        let db = Db::bind(db_src_path.to_path_buf()).await?;
+        db.read(move |read| {
+            let Some(table) = read_table_result(read.open_table(EN_KEY_TABLE))? else {
+                return Ok(None);
+            };
+            let Some(key) = table.get(&())? else {
+                return Ok(None);
+            };
+            let key: [u8; KEY_BYTES] = key.value().as_slice().try_into()?;
+            Ok(Some(key))
+        })
+        .await?
+    } else {
+        None
+    };
+    let key = match key {
+        Some(key) => key,
+        None => {
+            let key = read_key_from_stdin().await?;
+            let mut db = Db::bind(db_src_path.to_path_buf()).await?;
+            db.write(move |write| {
+                let mut table = write_table_result(write.open_table(EN_KEY_TABLE))?;
+                table.insert((), key.to_vec())?;
+                Ok(((), CloseWrite::Commit))
+            })
+            .await?;
+            key
+        }
+    };
     println!("{key:?}");
+    let mut db_src = File::options()
+        .read(true)
+        .open(&db_src_path)
+        .await
+        .with_context(|| anyhow::anyhow!("{db_src_path:?}"))?;
     let nonce: [u8; X_NONCE_BYTES] = rand::random();
     db_dst.write_all(&nonce).await?;
     let nonce = NonceBuf::XNonce(Box::new(nonce));

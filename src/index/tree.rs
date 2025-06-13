@@ -5,7 +5,7 @@ use bincode::{Decode, Encode};
 use redb::{ReadableTable, TableDefinition};
 
 use crate::{
-    db_val::Bincode,
+    db::val::Bincode,
     index::{read_table_result, write_table_result},
     path::CanPathBuf,
 };
