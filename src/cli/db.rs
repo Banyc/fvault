@@ -4,10 +4,11 @@ use std::{
 };
 
 use anyhow::Context;
+use async_compression::tokio::{bufread::BrotliDecoder, write::BrotliEncoder};
 use clap::Args;
 use tokio::{
     fs::{File, try_exists},
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     task::spawn_blocking,
 };
 use tokio_chacha20::{
@@ -19,7 +20,12 @@ use tokio_chacha20::{
     },
 };
 
-use crate::{cli::path::REPO_DIR_NAME, cx::INDEX_DB_NAME, limit_read::LimitReader};
+use crate::{
+    cli::path::REPO_DIR_NAME,
+    copy::{CopyConfig, copy_2},
+    cx::INDEX_DB_NAME,
+    limit_read::LimitReader,
+};
 
 pub const ENCRYPTED_DB_NAME: &str = "index.nah";
 pub const DECRYPTING_DB_NAME: &str = "index.tmp";
@@ -44,7 +50,6 @@ pub async fn exec_encrypt(_args: EncryptArgs, repo_base: impl AsRef<Path>) -> an
         .with_context(|| anyhow::anyhow!("{db_dst_path:?}"))?;
     let key = read_key_from_stdin().await?;
     println!("{key:?}");
-    let len = db_src.metadata().await?.len();
     let nonce: [u8; X_NONCE_BYTES] = rand::random();
     db_dst.write_all(&nonce).await?;
     let nonce = NonceBuf::XNonce(Box::new(nonce));
@@ -55,12 +60,21 @@ pub async fn exec_encrypt(_args: EncryptArgs, repo_base: impl AsRef<Path>) -> an
             hash: true,
         },
     };
+    println!("{}", db_dst.metadata().await?.len());
     let mut db_dst_en = ChaCha20Writer::new(&config, &mut db_dst);
-    db_dst_en.write_all(&len.to_le_bytes()).await?;
-    tokio::io::copy(&mut db_src, &mut db_dst_en).await?;
+    let mut db_dst_compressed = BrotliEncoder::new(&mut db_dst_en);
+    let config = CopyConfig { limit: None };
+    let copy_res = copy_2(&mut db_src, &mut db_dst_compressed, &config).await;
+    copy_res.res?;
+    db_dst_compressed.flush().await?;
+    db_dst_compressed.shutdown().await?;
     let (_, hasher) = db_dst_en.into_inner();
-    let tag = hasher.unwrap().finalize();
+    println!("{}", db_dst.metadata().await?.len());
+    let mut hasher = hasher.unwrap();
+    hasher.update(&(copy_res.amt as u64).to_le_bytes());
+    let tag = hasher.finalize();
     db_dst.write_all(&tag).await?;
+    db_dst.sync_data().await?;
     tokio::fs::remove_file(&db_src_path).await?;
     Ok(())
 }
@@ -96,6 +110,11 @@ async fn exec_decrypt_1(_args: DecryptArgs, repo_base: impl AsRef<Path>) -> anyh
         .open(&db_dst_path)
         .await
         .with_context(|| anyhow::anyhow!("{db_dst_path:?}"))?;
+    let compressed_len = usize::try_from(db_src.metadata().await?.len())?
+        .checked_sub(X_NONCE_BYTES)
+        .context("compressed_len")?
+        .checked_sub(BLOCK_BYTES)
+        .context("compressed_len")?;
     let key = read_key_from_stdin().await?;
     println!("{key:?}");
     let mut nonce = [0; X_NONCE_BYTES];
@@ -107,20 +126,24 @@ async fn exec_decrypt_1(_args: DecryptArgs, repo_base: impl AsRef<Path>) -> anyh
             hash: true,
         },
     };
-    let mut db_src_de = ChaCha20Reader::new(&config, &mut db_src);
-    let mut len = 0_u64.to_le_bytes();
-    db_src_de.read_exact(&mut len).await?;
-    let len = u64::from_le_bytes(len);
-    let len = usize::try_from(len)?;
-    let mut db_src_limited = LimitReader::new(&mut db_src_de, len);
-    tokio::io::copy(&mut db_src_limited, &mut db_dst).await?;
+    println!("{compressed_len}");
+    let mut db_src_limited = LimitReader::new(&mut db_src, compressed_len);
+    let mut db_src_de = ChaCha20Reader::new(&config, &mut db_src_limited);
+    let mut db_src_buffed = BufReader::new(&mut db_src_de);
+    let mut db_src_decompressed = BrotliDecoder::new(&mut db_src_buffed);
+    let copy_config = CopyConfig { limit: None };
+    let copy_res = copy_2(&mut db_src_decompressed, &mut db_dst, &copy_config).await;
+    copy_res.res?;
     let (_, hasher) = db_src_de.into_inner();
-    let expected_tag = hasher.unwrap().finalize();
+    let mut hasher = hasher.unwrap();
+    hasher.update(&(copy_res.amt as u64).to_le_bytes());
+    let expected_tag = hasher.finalize();
     let mut tag = [0; BLOCK_BYTES];
     db_src.read_exact(&mut tag).await?;
     if tag != expected_tag {
         return Err(anyhow::anyhow!("wrong key or file corrupted"));
     }
+    db_src.sync_data().await?;
     Ok(())
 }
 

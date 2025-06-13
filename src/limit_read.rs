@@ -1,7 +1,7 @@
 use std::{
     io,
     pin::{Pin, pin},
-    task::{Context, Poll},
+    task::{Context, Poll, ready},
 };
 
 use tokio::io::{AsyncRead, ReadBuf};
@@ -32,15 +32,15 @@ where
     ) -> Poll<io::Result<()>> {
         let remaining = self.limit - self.pos;
         if remaining == 0 {
-            return Poll::Ready(Ok(()));
+            return Ok(()).into();
         }
         let mut limit_buf = buf.take(remaining);
         let buf_filled_start = limit_buf.filled().len();
-        let res = pin!(&mut self.reader).poll_read(cx, &mut limit_buf);
+        ready!(pin!(&mut self.reader).poll_read(cx, &mut limit_buf)?);
         let buf_filled_end = limit_buf.filled().len();
         let filled = buf_filled_end - buf_filled_start;
         self.pos += filled;
         buf.advance(filled);
-        res
+        Ok(()).into()
     }
 }
